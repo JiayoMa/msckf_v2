@@ -242,28 +242,6 @@ class VIO(object):
             
             print("[VIO] Exiting with error code 1.")
             os._exit(1) # 强制杀死所有线程
-                    if len(self.timestamps) % 100 == 0:
-                        print(f"[VIO] Processed {len(self.timestamps)} frames. t={t:.2f}")
-
-        except Exception as e:
-            # --- 异常捕获区 ---
-            print("\n" + "!"*50)
-            print("[CRITICAL ERROR] VIO Thread crashed!")
-            print(f"Error Type: {type(e).__name__}")
-            print(f"Error Message: {e}")
-            print("-" * 20 + " Traceback " + "-" * 20)
-            traceback.print_exc()
-            print("!"*50 + "\n")
-            
-            print("[VIO] Attempting emergency save of trajectory data...")
-            try:
-                self.save_comparison_plot()
-                self.save_trajectory()
-            except Exception as save_err:
-                print(f"[VIO] Emergency save failed: {save_err}")
-            
-            print("[VIO] Exiting with error code 1.")
-            os._exit(1) # 强制杀死所有线程
 
     def save_comparison_plot(self):
         """绘制学术对比图"""
