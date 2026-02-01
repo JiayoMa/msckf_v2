@@ -107,13 +107,16 @@ class StateServer(object):
 
 
 class MSCKF(object):
-    def __init__(self, config):
+    def __init__(self, config, update_mode="msckf"):
         self.config = config
         self.optimization_config = config.optimization_config
         
         # --- [修改 1] 模式控制 ---
         # mode: 'train' (采集数据) / 'test' (对比实验) / 'normal' (纯MSCKF)
         self.mode = 'test' 
+        
+        # Update mode for measurement update: "msckf" or "sknet"
+        self.update_mode = update_mode
         
         # 初始化 Adapter (采集数据时 model_path 可为 None, device 建议用 cpu 避免显存占用)
         # 如果是 'test' 模式，请确保 model_path 指向真实模型，device='cuda'
@@ -624,9 +627,20 @@ class MSCKF(object):
         r = A.T @ r_j
 
         return H_x, r
-    def measurement_update(self, H, r):
+    def measurement_update(self, H, r, update_mode="msckf"):
+        """
+        MSCKF Measurement Update with optional SKNet integration
+        
+        Args:
+            H: Observation matrix
+            r: Residual vector
+            update_mode: "msckf" (traditional update) or "sknet" (use SKNet's K, Pk, Sk)
+        
+        Returns:
+            For backward compatibility with existing code
+        """
         if len(H) == 0 or len(r) == 0:
-            return None # 修改返回值，保持一致
+            return None
 
         # 1. QR Decomposition
         if H.shape[0] > H.shape[1]:
@@ -653,37 +667,40 @@ class MSCKF(object):
             # 每 500 帧存一次，防止内存爆炸
             if len(self.data_buffer) >= 500: 
                 self.flush_training_data()
-# --- 分支 B：SKNet 推理模式 (Shadow Update) ---
-        sknet_pos = None
-        if self.mode == 'test':
-            # 严格调用 Adapter
-            sknet_pos = self.sknet_adapter.update_shadow_trajectory(H_thin, r_thin)
-            
-            # --- [关键修改] 错误处理 ---
-            if sknet_pos is None:
-                # 策略：如果 SKNet 失败，打印红色警告，并且不要返回任何位置给绘图器
-                # 或者在这里 raise Exception("SKNet Lost Tracking") 强制退出
-                print("\033[91m[Critical] SKNet inference failed or diverged. Stopping shadow track.\033[0m")
-                # 即使失败，程序继续运行 baseline MSCKF，但在可视化中 SKNet 会消失或停止
-                # 如果你想整个程序退出，取消下面这行的注释：
-                raise RuntimeError("SKNet Failed.") 
-            else:
-                pass # SKNet 正常运行
 
-
-        # --- 以下为 MSCKF 标准更新逻辑 (Baseline) ---
+        # --- Get active dimension and covariance ---
         curr_dim = self.state_server.active_dim
         P_active = self.state_server.state_cov[:curr_dim, :curr_dim]
         
-        # Calculate S and K
-        S = H_thin @ P_active @ H_thin.T + (self.config.observation_noise * np.identity(len(H_thin)))
-        K_transpose = np.linalg.solve(S, H_thin @ P_active)
-        K = K_transpose.T
+        # --- Branch based on update_mode ---
+        if update_mode == "sknet":
+            # Use SKNet's predicted Kalman gain and covariances
+            result = self.sknet_adapter.get_optimal_gain(H_thin, r_thin, return_covariances=True)
+            
+            if result is None or result[0] is None:
+                print("\033[91m[Critical] SKNet inference failed. Cannot update state.\033[0m")
+                raise RuntimeError("SKNet inference failed.")
+            
+            K, Pk_sknet, Sk_sknet = result
+            
+            # For covariance update, we use SKNet's Pk
+            # Note: Pk_sknet should match curr_dim, so extract the active portion
+            if Pk_sknet.shape[0] < curr_dim or Pk_sknet.shape[1] < curr_dim:
+                print(f"[Warning] SKNet Pk dimension ({Pk_sknet.shape}) < active dim ({curr_dim})")
+                # Fallback to traditional update
+                update_mode = "msckf"
+            else:
+                P_active = Pk_sknet[:curr_dim, :curr_dim]
+        
+        if update_mode == "msckf":
+            # Traditional MSCKF update: Calculate S and K from P
+            S = H_thin @ P_active @ H_thin.T + (self.config.observation_noise * np.identity(len(H_thin)))
+            K_transpose = np.linalg.solve(S, H_thin @ P_active)
+            K = K_transpose.T
 
-        # Calculate delta_x
+        # Calculate delta_x using the appropriate K
         delta_x = K @ r_thin 
         
-
         # Update the IMU state
         delta_x_imu = delta_x[:21]
         if (np.linalg.norm(delta_x_imu[6:9]) > 0.5 or 
@@ -710,15 +727,21 @@ class MSCKF(object):
             cam_state.position += delta_x_cam[3:]
 
         # Update covariance
-        I_KH = np.identity(curr_dim) - K @ H_thin
-        P_new_active = I_KH @ P_active
-        self.state_server.state_cov[:curr_dim, :curr_dim] = (P_new_active + P_new_active.T) / 2.
+        if update_mode == "sknet":
+            # Use SKNet's posterior covariance directly
+            # Apply Joseph form for numerical stability: P_post = (I - KH)P_pred(I - KH)^T + KRK^T
+            # For simplicity, we use the provided Pk as the posterior
+            self.state_server.state_cov[:curr_dim, :curr_dim] = P_active
+        else:
+            # Traditional MSCKF covariance update
+            I_KH = np.identity(curr_dim) - K @ H_thin
+            P_new_active = I_KH @ P_active
+            self.state_server.state_cov[:curr_dim, :curr_dim] = (P_new_active + P_new_active.T) / 2.
         
         # --- [修改 6] 通知 Adapter 更新完成 (用于计算 state_inno) ---
         self.sknet_adapter.on_update_finished_msckf(self.state_server)
         
-        # 返回 sknet_pos 给 vio.py 进行绘图
-        return sknet_pos
+        return None  # Return None for consistency
         
     def flush_training_data(self):
         """将数据保存为 .npy 文件"""
@@ -829,7 +852,7 @@ class MSCKF(object):
         r = r[:stack_count]
 
         # Perform the measurement update step.
-        self.measurement_update(H_x, r)
+        self.measurement_update(H_x, r, update_mode=self.update_mode)
 
         # Remove all processed features from the map.
         for feature_id in processed_feature_ids:
@@ -945,7 +968,7 @@ class MSCKF(object):
         r = r[:stack_count]
 
         # Perform measurement update.
-        self.measurement_update(H_x, r)
+        self.measurement_update(H_x, r, update_mode=self.update_mode)
         for cam_id in rm_cam_state_ids:
             idx = list(self.state_server.cam_states.keys()).index(cam_id)
             cam_state_start = 21 + 6*idx

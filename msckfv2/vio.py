@@ -18,11 +18,12 @@ from image import ImageProcessor
 from msckf import MSCKF
 
 class VIO(object):
-    def __init__(self, config, img_queue, imu_queue, gt_path=None, save_dir="./results"):
+    def __init__(self, config, img_queue, imu_queue, gt_path=None, save_dir="./results", enable_sknet_comparison=False):
         self.config = config
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
         
+        self.enable_sknet_comparison = enable_sknet_comparison
         self.trajectory = []
         
         self.img_queue = img_queue
@@ -30,7 +31,23 @@ class VIO(object):
         self.feature_queue = Queue()
 
         self.image_processor = ImageProcessor(config)
-        self.msckf = MSCKF(config)
+        
+        # --- Create two MSCKF instances for comparison ---
+        if enable_sknet_comparison:
+            # Baseline MSCKF (traditional update)
+            self.msckf_baseline = MSCKF(config, update_mode="msckf")
+            self.msckf_baseline.mode = 'normal'  # Disable SKNet integration
+            
+            # SKNet-fusion MSCKF (uses SKNet K, Pk, Sk)
+            self.msckf_sknet = MSCKF(config, update_mode="sknet")
+            self.msckf_sknet.mode = 'test'  # Enable SKNet
+            # Note: User should set model_path in config or modify MSCKF.__init__
+            
+            print("[VIO] Running in DUAL MODE: Baseline MSCKF vs SKNet-Fusion MSCKF")
+        else:
+            # Single MSCKF instance (backward compatibility)
+            self.msckf = MSCKF(config, update_mode="msckf")
+            print("[VIO] Running in SINGLE MODE")
 
         # --- 数据容器 ---
         self.traj_msckf = []
@@ -99,7 +116,13 @@ class VIO(object):
             imu_msg = self.imu_queue.get()
             if imu_msg is None: return
             self.image_processor.imu_callback(imu_msg)
-            self.msckf.imu_callback(imu_msg)
+            
+            if self.enable_sknet_comparison:
+                # Feed IMU to both MSCKF instances
+                self.msckf_baseline.imu_callback(imu_msg)
+                self.msckf_sknet.imu_callback(imu_msg)
+            else:
+                self.msckf.imu_callback(imu_msg)
 
     def process_feature(self):
         """核心线程：后端优化 (MSCKF + SKNet)"""
@@ -110,8 +133,15 @@ class VIO(object):
                 # --- 1. 正常结束检查 ---
                 if feature_msg is None:
                     print("[VIO] Dataset finished. Finalizing...")
-                    if hasattr(self.msckf, 'finalize'):
-                        self.msckf.finalize()
+                    
+                    if self.enable_sknet_comparison:
+                        if hasattr(self.msckf_baseline, 'finalize'):
+                            self.msckf_baseline.finalize()
+                        if hasattr(self.msckf_sknet, 'finalize'):
+                            self.msckf_sknet.finalize()
+                    else:
+                        if hasattr(self.msckf, 'finalize'):
+                            self.msckf.finalize()
                     
                     self.save_comparison_plot() 
                     self.save_trajectory() 
@@ -120,43 +150,98 @@ class VIO(object):
                     return
                 
                 # --- 2. 执行更新 ---
-                # 这里会调用 Adapter，若 SKNet 失败会抛出 RuntimeError
-                result = self.msckf.feature_callback(feature_msg)
+                if self.enable_sknet_comparison:
+                    # Run both MSCKF instances in parallel
+                    # Note: feature_callback needs to be called separately for each instance
+                    # The image_processor is shared, but each MSCKF maintains its own state
+                    
+                    # Process baseline MSCKF
+                    result_baseline = self.msckf_baseline.feature_callback(feature_msg)
+                    
+                    # Process SKNet-fusion MSCKF
+                    result_sknet = self.msckf_sknet.feature_callback(feature_msg)
+                    
+                    if result_baseline is not None and result_sknet is not None:
+                        t = feature_msg.timestamp
+                        
+                        # Get positions from main states (not shadow trajectories)
+                        msckf_pos = self.msckf_baseline.state_server.imu_state.position.copy()
+                        sknet_pos = self.msckf_sknet.state_server.imu_state.position.copy()
+                        
+                        # Get ground truth
+                        gt_pos = self.get_gt_pose_at_time(t)
+                        
+                        # Store trajectories
+                        self.timestamps.append(t)
+                        self.traj_msckf.append(msckf_pos)
+                        self.traj_sknet.append(sknet_pos)
+                        self.traj_gt.append(gt_pos)
+                        
+                        self.trajectory.append(result_baseline.cam0_pose)
+                        
+                        # Print progress every 100 frames
+                        if len(self.timestamps) % 100 == 0:
+                            print(f"[VIO] Processed {len(self.timestamps)} frames. t={t:.2f}")
+                else:
+                    # Single MSCKF mode (backward compatibility)
+                    result = self.msckf.feature_callback(feature_msg)
+                    
+                    if result is not None:
+                        t = feature_msg.timestamp
+                        
+                        # --- [A] 获取 Baseline (MSCKF) ---
+                        msckf_pos = self.msckf.state_server.imu_state.position.copy()
+                        
+                        # --- [B] 获取 SKNet (Strict Mode) ---
+                        sknet_pos = None
+                        
+                        # 检查 Adapter 状态
+                        if hasattr(self.msckf, 'sknet_adapter') and self.msckf.sknet_adapter is not None:
+                            # 获取当前的 shadow state
+                            if self.msckf.sknet_adapter.shadow_pos is not None:
+                                sknet_pos = self.msckf.sknet_adapter.shadow_pos.copy()
+                        
+                        # --- [C] 严格终止检查 ---
+                        # 如果 MSCKF 成功了，但 SKNet 没有值，说明 SKNet 刚刚挂了
+                        if sknet_pos is None:
+                            err_msg = f"[VIO Critical] SKNet Lost Tracking at t={t:.3f} (shadow_pos is None)."
+                            print(f"\033[91m{err_msg}\033[0m")
+                            raise RuntimeError(err_msg) # 抛出异常进入 except 块
 
-                if result is not None:
-                    t = feature_msg.timestamp
+                        # --- [D] 获取真值 ---
+                        gt_pos = self.get_gt_pose_at_time(t)
+                        
+                        # 存入列表
+                        self.timestamps.append(t)
+                        self.traj_msckf.append(msckf_pos)
+                        self.traj_sknet.append(sknet_pos)
+                        self.traj_gt.append(gt_pos)
                     
-                    # --- [A] 获取 Baseline (MSCKF) ---
-                    msckf_pos = self.msckf.state_server.imu_state.position.copy()
-                    
-                    # --- [B] 获取 SKNet (Strict Mode) ---
-                    sknet_pos = None
-                    
-                    # 检查 Adapter 状态
-                    if hasattr(self.msckf, 'sknet_adapter') and self.msckf.sknet_adapter is not None:
-                        # 获取当前的 shadow state
-                        if self.msckf.sknet_adapter.shadow_pos is not None:
-                            sknet_pos = self.msckf.sknet_adapter.shadow_pos.copy()
-                    
-                    # --- [C] 严格终止检查 ---
-                    # 如果 MSCKF 成功了，但 SKNet 没有值，说明 SKNet 刚刚挂了
-                    if sknet_pos is None:
-                        err_msg = f"[VIO Critical] SKNet Lost Tracking at t={t:.3f} (shadow_pos is None)."
-                        print(f"\033[91m{err_msg}\033[0m")
-                        raise RuntimeError(err_msg) # 抛出异常进入 except 块
+                        self.trajectory.append(result.cam0_pose)
+                        
+                        # 可选：每 100 帧打印一次进度
+                        if len(self.timestamps) % 100 == 0:
+                            print(f"[VIO] Processed {len(self.timestamps)} frames. t={t:.2f}")
 
-                    # --- [D] 获取真值 ---
-                    gt_pos = self.get_gt_pose_at_time(t)
-                    
-                    # 存入列表
-                    self.timestamps.append(t)
-                    self.traj_msckf.append(msckf_pos)
-                    self.traj_sknet.append(sknet_pos)
-                    self.traj_gt.append(gt_pos)
-                
-                    self.trajectory.append(result.cam0_pose)
-                    
-                    # 可选：每 100 帧打印一次进度
+        except Exception as e:
+            # --- 异常捕获区 ---
+            print("\n" + "!"*50)
+            print("[CRITICAL ERROR] VIO Thread crashed!")
+            print(f"Error Type: {type(e).__name__}")
+            print(f"Error Message: {e}")
+            print("-" * 20 + " Traceback " + "-" * 20)
+            traceback.print_exc()
+            print("!"*50 + "\n")
+            
+            print("[VIO] Attempting emergency save of trajectory data...")
+            try:
+                self.save_comparison_plot()
+                self.save_trajectory()
+            except Exception as save_err:
+                print(f"[VIO] Emergency save failed: {save_err}")
+            
+            print("[VIO] Exiting with error code 1.")
+            os._exit(1) # 强制杀死所有线程
                     if len(self.timestamps) % 100 == 0:
                         print(f"[VIO] Processed {len(self.timestamps)} frames. t={t:.2f}")
 
@@ -274,6 +359,8 @@ if __name__ == '__main__':
         help='Path of EuRoC MAV dataset.')
     parser.add_argument('--save_dir', type=str, default='./results', 
         help='Directory to save results.')
+    parser.add_argument('--dual_mode', action='store_true',
+        help='Enable dual mode: run both baseline MSCKF and SKNet-fusion MSCKF for comparison.')
     args = parser.parse_args()
 
     # 路径检查
@@ -301,7 +388,8 @@ if __name__ == '__main__':
             gt_path = gt_path_alt
 
     # --- 3. 初始化 VIO 系统 ---
-    msckf_vio = VIO(config, img_queue, imu_queue, gt_path=gt_path, save_dir=args.save_dir)
+    msckf_vio = VIO(config, img_queue, imu_queue, gt_path=gt_path, save_dir=args.save_dir, 
+                    enable_sknet_comparison=args.dual_mode)
 
     # --- 4. 启动数据发布器 ---
     duration = float('inf')

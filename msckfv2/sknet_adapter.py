@@ -204,11 +204,21 @@ class SKNetAdapter:
         # Store current prediction for feature calculation in Step 2
         self.current_pred_temp = current_msckf_state.copy()
 
-    def get_optimal_gain(self, H_thin, r_thin):
+    def get_optimal_gain(self, H_thin, r_thin, return_covariances=False):
         """
         [Step 2] Core Inference: Calculate Kalman Gain (K) via Neural Network
+        
+        Args:
+            H_thin: Observation matrix after QR decomposition
+            r_thin: Residual vector after QR decomposition
+            return_covariances: If True, returns (K, Pk, Sk); otherwise returns K only (for backward compatibility)
+        
+        Returns:
+            If return_covariances=False: K_valid (numpy array)
+            If return_covariances=True: (K_valid, Pk_valid, Sk_valid) tuple
         """
-        if self.kf_net is None: return None
+        if self.kf_net is None: 
+            return None if not return_covariances else (None, None, None)
 
         # 1. Padding & Dimension Check
         H_pad, r_pad, (valid_obs, valid_state) = self._pad_qr_data(H_thin, r_thin)
@@ -216,13 +226,13 @@ class SKNetAdapter:
         # [Safety] If observation or state is too small (e.g., < IMU dim), skip
         if valid_obs == 0 or valid_state < 15:
             # print(f"[SKNetAdapter] Info: Small dims (obs={valid_obs}, state={valid_state}), skipping NN.")
-            return None
+            return None if not return_covariances else (None, None, None)
 
         # 2. History Initialization
         if self.first_run:
             self.obs_past = np.zeros_like(r_pad)
             if self.current_pred_temp is None:
-                return None
+                return None if not return_covariances else (None, None, None)
             self.state_post_past = self.current_pred_temp.copy()
             self.first_run = False
 
@@ -239,6 +249,8 @@ class SKNetAdapter:
 
         # 4. To Tensor (With Batch Dim)
         K_valid = None
+        Pk_valid = None
+        Sk_valid = None
 
         try:
             with torch.no_grad():
@@ -255,7 +267,7 @@ class SKNetAdapter:
                 # Check for NaNs
                 if torch.isnan(t_state_inno).any() or torch.isnan(t_r_pad).any():
                     print("[SKNetAdapter] Warning: NaN detected in input tensors.")
-                    return None
+                    return None if not return_covariances else (None, None, None)
 
                 # Inference
                 (Pk, Sk) = self.kf_net(
@@ -275,9 +287,16 @@ class SKNetAdapter:
                 K_tensor = Pk_mat @ t_H_mat.T @ Sk_mat
                 K_full = K_tensor.cpu().numpy()
                 
-                # Extract valid sub-matrix
+                # Extract valid sub-matrices
                 # K theoretical shape: (active_state_dim, active_obs_dim)
                 K_valid = K_full[:valid_state, :valid_obs]
+                
+                if return_covariances:
+                    # Extract valid portions of Pk and Sk
+                    Pk_full = Pk_mat.cpu().numpy()
+                    Sk_full = Sk_mat.cpu().numpy()
+                    Pk_valid = Pk_full[:valid_state, :valid_state]
+                    Sk_valid = Sk_full[:valid_obs, :valid_obs]
                 
         except Exception as e:
             print("\n" + "="*30)
@@ -285,13 +304,16 @@ class SKNetAdapter:
             print(f"Shapes -> state_inno: {state_inno.shape}, r: {r_pad.shape}")
             traceback.print_exc()
             print("="*30 + "\n")
-            return None
+            return None if not return_covariances else (None, None, None)
 
         # 5. Update History
         self.obs_past = r_pad.copy()
         self.state_pred_past = self.current_pred_temp.copy()
         
-        return K_valid
+        if return_covariances:
+            return (K_valid, Pk_valid, Sk_valid)
+        else:
+            return K_valid
 
     def update_shadow_trajectory(self, H, r):
         """
